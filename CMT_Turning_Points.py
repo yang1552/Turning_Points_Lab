@@ -165,7 +165,4 @@ sns.kdeplot(trough_df["Rate Change"], label="Trough", fill=True, ax=ax2)
 sns.kdeplot(control_rolling_df["Rate Change"], label="Control", fill=True, ax=ax2)
 ax2.legend()
 st.pyplot(fig2) 
-## 추가해 보기
-## 하나더
-# 이것도 되나
 
