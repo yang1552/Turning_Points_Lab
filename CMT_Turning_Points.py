@@ -1,3 +1,4 @@
+# 기존 import 및 데이터 로딩 코드는 그대로 유지
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5,6 +6,7 @@ from statsmodels.nonparametric.smoothers_lowess import lowess
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import ttest_ind
+from sklearn.metrics import pairwise_distances
 
 # ---- Sidebar 설정 ----
 maturity_options = {
@@ -13,7 +15,6 @@ maturity_options = {
     "10Y": "DGS10",
     "30Y": "DGS30"
 }
-
 selected_maturity = st.sidebar.selectbox("Select Treasury Maturity", list(maturity_options.keys()))
 fred_id = maturity_options[selected_maturity]
 
@@ -40,10 +41,10 @@ if start_date > end_date:
 
 # 파라미터
 frac = st.sidebar.slider("LOESS Smoothing (frac)", 0.001, 0.2, 0.05, step=0.005)
-threshold = st.sidebar.slider("Slope Threshold", min_value=0.0001, max_value=0.02, value=0.005, step=0.0005, format="%.4f")
+threshold = st.sidebar.slider("Slope Threshold", 0.0001, 0.02, 0.005, step=0.0005, format="%.4f")
 window = st.sidebar.slider("Turning Point Window (days)", 5, 90, 30, step=5)
 
-# 분석 범위 제한
+# 분석 대상 제한
 df = df[(df["Date"] >= pd.to_datetime(start_date)) & (df["Date"] <= pd.to_datetime(end_date))].copy()
 
 # LOESS 스무딩
@@ -51,12 +52,13 @@ smoothed = lowess(df['Rate'], df['Date'], frac=frac)
 smoothed_dates = pd.to_datetime(smoothed[:, 0])
 smoothed_values = smoothed[:, 1]
 
-# 기울기 계산
+# 기울기 계산 및 전환점 후보 탐색
 slopes = np.diff(smoothed_values)
 slope_dates = smoothed_dates[1:]
 candidate_idxs = np.where((np.abs(slopes) > 0) & (np.abs(slopes) < threshold))[0]
 
-def find_turning_points(values, dates, candidate_idxs, window):
+# 전환점 탐색 함수
+def find_turning_points(values, candidate_idxs, window):
     peaks, troughs = [], []
     for idx in candidate_idxs:
         start = max(0, idx - window)
@@ -69,9 +71,9 @@ def find_turning_points(values, dates, candidate_idxs, window):
             troughs.append(idx)
     return peaks, troughs
 
-peak_idxs, trough_idxs = find_turning_points(smoothed_values, smoothed_dates, candidate_idxs, window)
+peak_idxs, trough_idxs = find_turning_points(smoothed_values, candidate_idxs, window)
 
-# 전환점 시각화
+# 시각화
 st.title(f"{selected_maturity} CMT Rate Turning Point Analyzer")
 fig, ax = plt.subplots(figsize=(14, 6))
 ax.plot(df['Date'], df['Rate'], label='Raw Rate', alpha=0.4)
@@ -82,6 +84,7 @@ ax.legend()
 ax.grid(True)
 st.pyplot(fig)
 
+# 전환점 구간 분석 함수
 def analyze_segment(df, dates, window):
     rows = []
     for dt in dates:
@@ -104,6 +107,7 @@ def analyze_segment(df, dates, window):
 peak_df = analyze_segment(df, slope_dates[peak_idxs], window)
 trough_df = analyze_segment(df, slope_dates[trough_idxs], window)
 
+# Control 구간
 exclude_dates = set()
 for idx in peak_idxs + trough_idxs:
     ref = slope_dates[idx]
@@ -126,7 +130,6 @@ for i in range(len(control_df) - window):
         "Max Daily Change": changes.max(),
         "Min Daily Change": changes.min()
     })
-
 control_rolling_df = pd.DataFrame(rolling_stats)
 
 # 테이블 및 다운로드
@@ -138,7 +141,7 @@ st.markdown("### 📋 Trough Analysis")
 st.dataframe(trough_df)
 st.download_button("Download Trough Stats", data=trough_df.to_csv(index=False), file_name="trough_stats.csv")
 
-st.markdown("### 📋 Control Period (Non-Turning Points)")
+st.markdown("### 📋 Control Period")
 st.dataframe(control_rolling_df)
 st.download_button("Download Control Period Stats", data=control_rolling_df.to_csv(index=False), file_name="control_stats.csv")
 
@@ -157,12 +160,40 @@ def compare_groups(label, a_df, b_df):
 compare_groups("Peak", peak_df, control_rolling_df)
 compare_groups("Trough", trough_df, control_rolling_df)
 
-# 분포 시각화
-st.markdown("### 📊 Distribution of Rate Changes")
-fig2, ax2 = plt.subplots()
-sns.kdeplot(peak_df["Rate Change"], label="Peak", fill=True, ax=ax2)
-sns.kdeplot(trough_df["Rate Change"], label="Trough", fill=True, ax=ax2)
-sns.kdeplot(control_rolling_df["Rate Change"], label="Control", fill=True, ax=ax2)
-ax2.legend()
-st.pyplot(fig2) 
+# 🔄 최신 구간과의 유사도 비교 분석
+st.markdown("### 🔍 Similarity to Latest Period")
 
+latest_window_df = df.tail(window)
+if len(latest_window_df) >= 2:
+    changes = latest_window_df["Rate"].diff().dropna()
+    latest_summary = pd.DataFrame([{
+        "Mean Rate": latest_window_df["Rate"].mean(),
+        "Std Dev": latest_window_df["Rate"].std(),
+        "Rate Change": latest_window_df["Rate"].iloc[-1] - latest_window_df["Rate"].iloc[0],
+        "Max Daily Change": changes.max(),
+        "Min Daily Change": changes.min()
+    }])
+
+    def get_mean_distance(target_df, ref_df):
+        features = ["Mean Rate", "Std Dev", "Rate Change", "Max Daily Change", "Min Daily Change"]
+        distances = pairwise_distances(target_df[features], ref_df[features], metric="euclidean")
+        return distances.mean()
+
+    peak_dist = get_mean_distance(latest_summary, peak_df)
+    trough_dist = get_mean_distance(latest_summary, trough_df)
+    control_dist = get_mean_distance(latest_summary, control_rolling_df)
+
+    similarity_result = pd.DataFrame({
+        "Group": ["Peak", "Trough", "Control"],
+        "Distance": [peak_dist, trough_dist, control_dist]
+    }).sort_values(by="Distance")
+
+    st.dataframe(similarity_result)
+
+    # 유사도 시각화
+    fig3, ax3 = plt.subplots()
+    sns.barplot(data=similarity_result, x="Group", y="Distance", ax=ax3)
+    ax3.set_title("Similarity to Latest Period (Lower = More Similar)")
+    st.pyplot(fig3)
+
+    st.success(f"🧭 Latest period is most similar to: **{similarity_result.iloc[0]['Group']}**")
